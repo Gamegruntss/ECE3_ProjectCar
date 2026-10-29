@@ -1,13 +1,8 @@
-// LINE FOLLOWING CAR
-// Weighting: (-8, -4, -2, -1, +1, +2, +4, +8) / 4
+// LINE FOLLOWING CAR — DIAGNOSTIC VERSION
+// Open Serial Monitor at 115200 baud.
 //
-// ASSUMPTIONS:
-// 1. Calibration values came from RC discharge times in microseconds.
-// 2. A longer discharge time means the sensor is over the line.
-// 3. Both direction pins LOW drive the car forward.
-// 4. Negative calibrated position means line left; positive means right.
-
-// ---------------- Motor pins ----------------
+// Assumes calibration uses RC discharge times in microseconds.
+// Longer discharge time is assumed to mean line detected.
 
 const int left_nslp_pin  = 31;
 const int left_dir_pin   = 29;
@@ -17,102 +12,68 @@ const int right_nslp_pin = 11;
 const int right_dir_pin  = 30;
 const int right_pwm_pin  = 39;
 
-// ---------------- Sensor pins ----------------
-
-// Ordered from left to right.
 const int photoPins[8] = {
   65, 48, 64, 47, 52, 68, 53, 69
 };
 
 const float photoWeights[8] = {
-  -8.0f / 4.0f,
-  -4.0f / 4.0f,
-  -2.0f / 4.0f,
-  -1.0f / 4.0f,
-   1.0f / 4.0f,
-   2.0f / 4.0f,
-   4.0f / 4.0f,
-   8.0f / 4.0f
+  -2.0f, -1.0f, -0.5f, -0.25f,
+   0.25f, 0.5f, 1.0f, 2.0f
 };
-
-// ---------------- IR LEDs ----------------
 
 const int IR_LED_odd  = 45;
 const int IR_LED_even = 61;
 
-// ---------------- Sensor settings ----------------
-
-const unsigned long chargeTimeUs = 10;
-
-// Must exceed the longest individual sensor discharge time.
-// 10000 us is a starting setting, not supplied by your calibration.
+const unsigned long chargeTimeUs   = 10;
 const unsigned long sensorTimeoutUs = 10000;
-
-// Starting threshold based on the original code's 2 ms read.
-// Check this against individual readings on the line and background.
 const unsigned long lineThresholdUs = 2000;
 
-// ---------------- Driving settings ----------------
-
-// Assumes the default 8-bit PWM range.
 const int PWM_MAX = 255;
-
-const int baseSpeed    = 65;
-const int turnSpeed    = 85;
-const int searchSpeed  = 55;
+const int baseSpeed = 65;
+const int turnSpeed = 85;
+const int searchSpeed = 55;
 
 const unsigned long timeToTurnMs = 700;
-
-// Set to -1 if the car steers away from the line.
-// With +1, positive position makes the left wheel faster.
 const int steeringSign = 1;
 
-
-// Calibration position is divided by 32 before applying these.
 const float kP = 50.0f;
 const float kD = 150.0f;
 
 const unsigned long controlPeriodUs = 5000;
 
-//End-marker settings 
-
 const int markerSensorCount = 6;
-
-// Require a sustained wide line before counting it.
 const unsigned long markerConfirmMs = 25;
-
-// Require the wide line to clear before another can count.
 const unsigned long markerClearMs = 100;
 
-const int calibrationCount = 17;
+// Fixed missing comma.
+// Removed +32 because its reading drops below the +28 reading.
+const int calibrationCount = 16;
 
 const float calibratedPosition[calibrationCount] = {
   -32, -28, -24, -20, -16, -12, -8, -4,
-    0,
-    4,   8,  12,  16,  20,  24, 28, 32
+    0,   4,   8,  12,  16,  20, 24, 28
 };
 
 const float calibratedReading[calibrationCount] = {
   -2226.719199f,
-  -1560.40039f,
-  -1128.548502
--725.1264949f,
--582.3227173f,
--450.0611413f,
--304.1680368f,
--183.219619f,
-83.91175667f,
-298.6762051f,
-401.1685668f,
-607.476123f,
-727.3684738f,
-1090.597989f,
-1388.940946f,
-2301.324419f,
-2122.495693,
+  -1560.400390f,
+  -1128.548502f,
+   -725.1264949f,
+   -582.3227173f,
+   -450.0611413f,
+   -304.1680368f,
+   -183.2196190f,
+     83.91175667f,
+    298.6762051f,
+    401.1685668f,
+    607.4761230f,
+    727.3684738f,
+   1090.597989f,
+   1388.940946f,
+   2301.324419f
 };
 
-//State
+// ---------------- State ----------------
 
 unsigned long sensorReading[8];
 
@@ -132,33 +93,127 @@ unsigned long markerStartedMs = 0;
 unsigned long clearStartedMs = 0;
 unsigned long previousControlUs = 0;
 
-// Motor helpers
+// Diagnostic values: these are commanded outputs.
+int commandedLeftPWM = 0;
+int commandedRightPWM = 0;
+
+float debugWeighted = 0.0f;
+float debugPosition = 0.0f;
+float debugError = 0.0f;
+float debugCorrection = 0.0f;
+int debugSensorCount = 0;
+
+unsigned long lastPrintMs = 0;
+
+// ---------------- Motor helpers ----------------
 
 void setForwardSpeeds(int leftSpeed, int rightSpeed) {
-  leftSpeed  = constrain(leftSpeed,  0, PWM_MAX);
-  rightSpeed = constrain(rightSpeed, 0, PWM_MAX);
+  commandedLeftPWM = constrain(leftSpeed, 0, PWM_MAX);
+  commandedRightPWM = constrain(rightSpeed, 0, PWM_MAX);
 
   digitalWrite(left_dir_pin, LOW);
   digitalWrite(right_dir_pin, LOW);
 
-  analogWrite(left_pwm_pin, leftSpeed);
-  analogWrite(right_pwm_pin, rightSpeed);
+  analogWrite(left_pwm_pin, commandedLeftPWM);
+  analogWrite(right_pwm_pin, commandedRightPWM);
 }
 
 void stopMotors() {
+  commandedLeftPWM = 0;
+  commandedRightPWM = 0;
+
   analogWrite(left_pwm_pin, 0);
   analogWrite(right_pwm_pin, 0);
 }
 
+// ---------------- Diagnostics ----------------
+
+void printDiagnostics(const char* state) {
+  unsigned long nowMs = millis();
+
+  if (nowMs - lastPrintMs < 500) {
+    return;
+  }
+
+  lastPrintMs = nowMs;
+
+  Serial.print("t=");
+  Serial.print(nowMs);
+
+  Serial.print(" | STATE=");
+  Serial.print(state);
+
+  Serial.print(" | sensors_us=[");
+
+  int timeoutCount = 0;
+
+  for (int i = 0; i < 8; i++) {
+    Serial.print(sensorReading[i]);
+
+    if (i < 7) {
+      Serial.print(",");
+    }
+
+    if (sensorReading[i] >= sensorTimeoutUs) {
+      timeoutCount++;
+    }
+  }
+
+  Serial.print("] | lineBits=");
+
+  for (int i = 0; i < 8; i++) {
+    Serial.print(sensorReading[i] >= lineThresholdUs ? 1 : 0);
+  }
+
+  Serial.print(" | count=");
+  Serial.print(debugSensorCount);
+
+  Serial.print(" | timeouts=");
+  Serial.print(timeoutCount);
+
+  Serial.print(" | weighted=");
+  Serial.print(debugWeighted, 2);
+
+  Serial.print(" | position=");
+  Serial.print(debugPosition, 2);
+
+  Serial.print(" | error=");
+  Serial.print(debugError, 3);
+
+  Serial.print(" | correction=");
+  Serial.print(debugCorrection, 2);
+
+  Serial.print(" | PWM_L=");
+  Serial.print(commandedLeftPWM);
+
+  Serial.print(" | PWM_R=");
+  Serial.print(commandedRightPWM);
+
+  Serial.print(" | markers=");
+  Serial.print(lineCount);
+
+  Serial.print(" | armed=");
+  Serial.println(markerArmed ? 1 : 0);
+}
+
+// ---------------- Turnaround ----------------
+
 void turnAround() {
+  Serial.println("EVENT: First marker. Starting 700 ms turnaround.");
+
   stopMotors();
 
-  // Reverse the left motor and drive the right motor forward.
   digitalWrite(left_dir_pin, HIGH);
   digitalWrite(right_dir_pin, LOW);
 
-  analogWrite(left_pwm_pin, turnSpeed);
-  analogWrite(right_pwm_pin, turnSpeed);
+  commandedLeftPWM = turnSpeed;
+  commandedRightPWM = turnSpeed;
+
+  analogWrite(left_pwm_pin, commandedLeftPWM);
+  analogWrite(right_pwm_pin, commandedRightPWM);
+
+  Serial.print("TURN: left DIR=HIGH, right DIR=LOW, both PWM=");
+  Serial.println(turnSpeed);
 
   delay(timeToTurnMs);
 
@@ -169,6 +224,8 @@ void turnAround() {
 
   havePreviousError = false;
   lastSeenError = 0.0f;
+
+  Serial.println("EVENT: Turnaround finished.");
 }
 
 // ---------------- Sensor reading ----------------
@@ -176,7 +233,6 @@ void turnAround() {
 void readSensors() {
   bool finished[8];
 
-  // Charge all eight sensor capacitors.
   for (int i = 0; i < 8; i++) {
     pinMode(photoPins[i], OUTPUT);
     digitalWrite(photoPins[i], HIGH);
@@ -187,7 +243,6 @@ void readSensors() {
 
   delayMicroseconds(chargeTimeUs);
 
-  // Release the pins and disable internal pull-ups.
   for (int i = 0; i < 8; i++) {
     pinMode(photoPins[i], INPUT);
     digitalWrite(photoPins[i], LOW);
@@ -196,7 +251,6 @@ void readSensors() {
   unsigned long startedUs = micros();
   int remaining = 8;
 
-  // Measure how long each pin stays HIGH.
   while (remaining > 0) {
     unsigned long elapsedUs = micros() - startedUs;
 
@@ -236,7 +290,6 @@ int getLineSensorCount() {
   return count;
 }
 
-// Convert weighted reading to position using linear interpolation.
 float readingToPosition(float reading) {
   if (reading <= calibratedReading[0]) {
     return calibratedPosition[0];
@@ -261,25 +314,25 @@ float readingToPosition(float reading) {
   return 0.0f;
 }
 
-// End-marker detection
+// ---------------- Marker detection ----------------
 
-// Returns true if this loop should skip normal steering.
 bool handleMarker(int sensorCount) {
   unsigned long nowMs = millis();
 
   if (sensorCount >= markerSensorCount) {
     clearTiming = false;
+    havePreviousError = false;
 
     if (!markerArmed) {
-      // Continue through the marker without counting it again.
       setForwardSpeeds(baseSpeed, baseSpeed);
-      havePreviousError = false;
+      printDiagnostics("CROSSING_MARKER");
       return true;
     }
 
     if (!markerTiming) {
       markerTiming = true;
       markerStartedMs = nowMs;
+      Serial.println("EVENT: 6+ sensors active; checking for marker.");
     }
 
     if (nowMs - markerStartedMs >= markerConfirmMs) {
@@ -288,19 +341,28 @@ bool handleMarker(int sensorCount) {
       markerArmed = false;
       markerTiming = false;
 
+      Serial.print("EVENT: Confirmed marker number ");
+      Serial.println(lineCount);
+
       if (lineCount == 1) {
         turnAround();
       } else {
         stopped = true;
         stopMotors();
+
+        Serial.println("EVENT: Second marker. Permanent stop until reset.");
       }
 
       return true;
     }
 
     setForwardSpeeds(baseSpeed, baseSpeed);
-    havePreviousError = false;
+    printDiagnostics("CONFIRMING_MARKER");
     return true;
+  }
+
+  if (markerTiming) {
+    Serial.println("EVENT: Wide reading cleared before marker confirmed.");
   }
 
   markerTiming = false;
@@ -314,15 +376,21 @@ bool handleMarker(int sensorCount) {
     if (nowMs - clearStartedMs >= markerClearMs) {
       markerArmed = true;
       clearTiming = false;
+
+      Serial.println("EVENT: Marker detection rearmed.");
     }
   }
 
   return false;
 }
 
-// Setup
+// ---------------- Setup ----------------
 
 void setup() {
+  Serial.begin(115200);
+
+  // Do not wait for Serial: the car can run without a monitor.
+
   pinMode(left_nslp_pin, OUTPUT);
   pinMode(left_dir_pin, OUTPUT);
   pinMode(left_pwm_pin, OUTPUT);
@@ -331,28 +399,41 @@ void setup() {
   pinMode(right_dir_pin, OUTPUT);
   pinMode(right_pwm_pin, OUTPUT);
 
-  digitalWrite(left_nslp_pin, HIGH);
-  digitalWrite(right_nslp_pin, HIGH);
+  stopMotors();
 
   digitalWrite(left_dir_pin, LOW);
   digitalWrite(right_dir_pin, LOW);
 
-  stopMotors();
+  digitalWrite(left_nslp_pin, HIGH);
+  digitalWrite(right_nslp_pin, HIGH);
 
   pinMode(IR_LED_odd, OUTPUT);
   pinMode(IR_LED_even, OUTPUT);
 
   digitalWrite(IR_LED_odd, HIGH);
   digitalWrite(IR_LED_even, HIGH);
+
+  Serial.println();
+  Serial.println("BOOT: Line follower diagnostic sketch started.");
+  Serial.println("CONFIG: Motor sleep pins commanded HIGH.");
+  Serial.println("CONFIG: Forward direction pins commanded LOW.");
+  Serial.println("CONFIG: Both IR LED pins commanded HIGH.");
+
+  Serial.print("CONFIG: Line threshold, us = ");
+  Serial.println(lineThresholdUs);
+
+  Serial.print("CONFIG: Sensor timeout, us = ");
+  Serial.println(sensorTimeoutUs);
+
+  Serial.print("CONFIG: Base PWM = ");
+  Serial.println(baseSpeed);
+
+  Serial.println("Diagnostics print every 500 ms.");
 }
 
-// Main loop
-void loop() {
-  if (stopped) {
-    stopMotors();
-    return;
-  }
+// ---------------- Main loop ----------------
 
+void loop() {
   unsigned long nowUs = micros();
   unsigned long elapsedUs = nowUs - previousControlUs;
 
@@ -362,49 +443,60 @@ void loop() {
 
   previousControlUs = nowUs;
 
+  // Continue reading even after stopping, so diagnostics stay live.
   readSensors();
 
-  int sensorCount = getLineSensorCount();
+  debugSensorCount = getLineSensorCount();
+  debugWeighted = getWeightedReading();
+  debugPosition = readingToPosition(debugWeighted);
+  debugError = debugPosition / 32.0f;
+  debugCorrection = 0.0f;
 
-  if (handleMarker(sensorCount)) {
+  if (stopped) {
+    stopMotors();
+    printDiagnostics("STOPPED_SECOND_MARKER");
     return;
   }
 
-  // Lost the line: turn toward the last known line position.
-  if (sensorCount == 0) {
+  if (handleMarker(debugSensorCount)) {
+    return;
+  }
+
+  if (debugSensorCount == 0) {
+    havePreviousError = false;
+
     if (lastSeenError > 0.0f) {
       if (steeringSign > 0) {
         setForwardSpeeds(searchSpeed, 0);
       } else {
         setForwardSpeeds(0, searchSpeed);
       }
+
+      printDiagnostics("LOST_SEARCH_POSITIVE");
+
     } else if (lastSeenError < 0.0f) {
       if (steeringSign > 0) {
         setForwardSpeeds(0, searchSpeed);
       } else {
         setForwardSpeeds(searchSpeed, 0);
       }
+
+      printDiagnostics("LOST_SEARCH_NEGATIVE");
+
     } else {
-      // No previous direction is available.
       stopMotors();
+      printDiagnostics("STOPPED_NO_LINE_NO_HISTORY");
     }
 
-    havePreviousError = false;
     return;
   }
 
-  float weightedReading = getWeightedReading();
-  float position = readingToPosition(weightedReading);
-
-  // Normalize calibrated position to approximately -1 ... +1.
-  // The measured centre offset is already handled by interpolation.
-  float error = position / 32.0f;
-
+  float error = debugError;
   float errorChange = 0.0f;
 
   if (havePreviousError) {
-    // Scale to a nominal 5 ms update interval.
-    errorChange = (error - previousError) *
+    errorChange =
+      (error - previousError) *
       ((float)controlPeriodUs / (float)elapsedUs);
   }
 
@@ -417,7 +509,9 @@ void loop() {
      (float)baseSpeed
   );
 
-  int leftSpeed  = (int)(baseSpeed + correction);
+  debugCorrection = correction;
+
+  int leftSpeed = (int)(baseSpeed + correction);
   int rightSpeed = (int)(baseSpeed - correction);
 
   setForwardSpeeds(leftSpeed, rightSpeed);
@@ -428,4 +522,6 @@ void loop() {
   if (error > 0.02f || error < -0.02f) {
     lastSeenError = error;
   }
+
+  printDiagnostics("FOLLOWING");
 }
