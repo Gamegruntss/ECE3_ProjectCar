@@ -1,8 +1,14 @@
 // LINE FOLLOWING CAR — DIAGNOSTIC VERSION
-// Open Serial Monitor at 115200 baud.
+// Weighting: (-8, -4, -2, -1, +1, +2, +4, +8) / 4
 //
-// Assumes calibration uses RC discharge times in microseconds.
-// Longer discharge time is assumed to mean line detected.
+// Assumes:
+// - Calibration uses RC discharge times in microseconds.
+// - Longer discharge time means line detected.
+// - Both motor direction pins LOW means forward.
+//
+// If no line has been detected yet, drive forward to acquire it.
+
+// ---------------- Motor pins ----------------
 
 const int left_nslp_pin  = 31;
 const int left_dir_pin   = 29;
@@ -12,6 +18,9 @@ const int right_nslp_pin = 11;
 const int right_dir_pin  = 30;
 const int right_pwm_pin  = 39;
 
+// ---------------- Sensors ----------------
+
+// Left to right.
 const int photoPins[8] = {
   65, 48, 64, 47, 52, 68, 53, 69
 };
@@ -24,16 +33,23 @@ const float photoWeights[8] = {
 const int IR_LED_odd  = 45;
 const int IR_LED_even = 61;
 
-const unsigned long chargeTimeUs   = 10;
+const unsigned long chargeTimeUs = 10;
 const unsigned long sensorTimeoutUs = 10000;
+
+// Still needs verification against individual sensor readings.
 const unsigned long lineThresholdUs = 2000;
 
+// ---------------- Driving ----------------
+
 const int PWM_MAX = 255;
-const int baseSpeed = 65;
-const int turnSpeed = 85;
+
+const int baseSpeed   = 65;
+const int turnSpeed   = 85;
 const int searchSpeed = 55;
 
 const unsigned long timeToTurnMs = 700;
+
+// Change to -1 if steering is reversed.
 const int steeringSign = 1;
 
 const float kP = 50.0f;
@@ -41,12 +57,17 @@ const float kD = 150.0f;
 
 const unsigned long controlPeriodUs = 5000;
 
+// ---------------- End markers ----------------
+
 const int markerSensorCount = 6;
+
 const unsigned long markerConfirmMs = 25;
 const unsigned long markerClearMs = 100;
 
-// Fixed missing comma.
-// Removed +32 because its reading drops below the +28 reading.
+// ---------------- Calibration ----------------
+
+// Missing comma fixed.
+// +32 excluded because its reading decreases relative to +28.
 const int calibrationCount = 16;
 
 const float calibratedPosition[calibrationCount] = {
@@ -93,7 +114,8 @@ unsigned long markerStartedMs = 0;
 unsigned long clearStartedMs = 0;
 unsigned long previousControlUs = 0;
 
-// Diagnostic values: these are commanded outputs.
+// ---------------- Diagnostics ----------------
+
 int commandedLeftPWM = 0;
 int commandedRightPWM = 0;
 
@@ -101,8 +123,8 @@ float debugWeighted = 0.0f;
 float debugPosition = 0.0f;
 float debugError = 0.0f;
 float debugCorrection = 0.0f;
-int debugSensorCount = 0;
 
+int debugSensorCount = 0;
 unsigned long lastPrintMs = 0;
 
 // ---------------- Motor helpers ----------------
@@ -125,8 +147,6 @@ void stopMotors() {
   analogWrite(left_pwm_pin, 0);
   analogWrite(right_pwm_pin, 0);
 }
-
-// ---------------- Diagnostics ----------------
 
 void printDiagnostics(const char* state) {
   unsigned long nowMs = millis();
@@ -199,7 +219,7 @@ void printDiagnostics(const char* state) {
 // ---------------- Turnaround ----------------
 
 void turnAround() {
-  Serial.println("EVENT: First marker. Starting 700 ms turnaround.");
+  Serial.println("EVENT: First marker. Starting turnaround.");
 
   stopMotors();
 
@@ -212,7 +232,7 @@ void turnAround() {
   analogWrite(left_pwm_pin, commandedLeftPWM);
   analogWrite(right_pwm_pin, commandedRightPWM);
 
-  Serial.print("TURN: left DIR=HIGH, right DIR=LOW, both PWM=");
+  Serial.print("TURN: left reverse, right forward, PWM=");
   Serial.println(turnSpeed);
 
   delay(timeToTurnMs);
@@ -228,7 +248,7 @@ void turnAround() {
   Serial.println("EVENT: Turnaround finished.");
 }
 
-// ---------------- Sensor reading ----------------
+// ---------------- Read sensors ----------------
 
 void readSensors() {
   bool finished[8];
@@ -290,6 +310,8 @@ int getLineSensorCount() {
   return count;
 }
 
+// ---------------- Calibration lookup ----------------
+
 float readingToPosition(float reading) {
   if (reading <= calibratedReading[0]) {
     return calibratedPosition[0];
@@ -314,7 +336,7 @@ float readingToPosition(float reading) {
   return 0.0f;
 }
 
-// ---------------- Marker detection ----------------
+// ---------------- Marker handling ----------------
 
 bool handleMarker(int sensorCount) {
   unsigned long nowMs = millis();
@@ -332,7 +354,8 @@ bool handleMarker(int sensorCount) {
     if (!markerTiming) {
       markerTiming = true;
       markerStartedMs = nowMs;
-      Serial.println("EVENT: 6+ sensors active; checking for marker.");
+
+      Serial.println("EVENT: Wide line detected; checking marker.");
     }
 
     if (nowMs - markerStartedMs >= markerConfirmMs) {
@@ -341,7 +364,7 @@ bool handleMarker(int sensorCount) {
       markerArmed = false;
       markerTiming = false;
 
-      Serial.print("EVENT: Confirmed marker number ");
+      Serial.print("EVENT: Confirmed marker ");
       Serial.println(lineCount);
 
       if (lineCount == 1) {
@@ -350,7 +373,7 @@ bool handleMarker(int sensorCount) {
         stopped = true;
         stopMotors();
 
-        Serial.println("EVENT: Second marker. Permanent stop until reset.");
+        Serial.println("EVENT: Second marker. Stopped until reset.");
       }
 
       return true;
@@ -362,7 +385,7 @@ bool handleMarker(int sensorCount) {
   }
 
   if (markerTiming) {
-    Serial.println("EVENT: Wide reading cleared before marker confirmed.");
+    Serial.println("EVENT: Wide reading cleared before confirmation.");
   }
 
   markerTiming = false;
@@ -389,8 +412,6 @@ bool handleMarker(int sensorCount) {
 void setup() {
   Serial.begin(115200);
 
-  // Do not wait for Serial: the car can run without a monitor.
-
   pinMode(left_nslp_pin, OUTPUT);
   pinMode(left_dir_pin, OUTPUT);
   pinMode(left_pwm_pin, OUTPUT);
@@ -414,10 +435,11 @@ void setup() {
   digitalWrite(IR_LED_even, HIGH);
 
   Serial.println();
-  Serial.println("BOOT: Line follower diagnostic sketch started.");
+  Serial.println("BOOT: Diagnostic line follower started.");
   Serial.println("CONFIG: Motor sleep pins commanded HIGH.");
-  Serial.println("CONFIG: Forward direction pins commanded LOW.");
-  Serial.println("CONFIG: Both IR LED pins commanded HIGH.");
+  Serial.println("CONFIG: Direction pins LOW = assumed forward.");
+  Serial.println("CONFIG: IR LED pins commanded HIGH.");
+  Serial.println("CONFIG: No initial line -> drive forward.");
 
   Serial.print("CONFIG: Line threshold, us = ");
   Serial.println(lineThresholdUs);
@@ -427,8 +449,6 @@ void setup() {
 
   Serial.print("CONFIG: Base PWM = ");
   Serial.println(baseSpeed);
-
-  Serial.println("Diagnostics print every 500 ms.");
 }
 
 // ---------------- Main loop ----------------
@@ -443,7 +463,7 @@ void loop() {
 
   previousControlUs = nowUs;
 
-  // Continue reading even after stopping, so diagnostics stay live.
+  // Keep sensor diagnostics live even after the finish stop.
   readSensors();
 
   debugSensorCount = getLineSensorCount();
@@ -461,6 +481,8 @@ void loop() {
   if (handleMarker(debugSensorCount)) {
     return;
   }
+
+  // ---------------- No line detected ----------------
 
   if (debugSensorCount == 0) {
     havePreviousError = false;
@@ -484,12 +506,15 @@ void loop() {
       printDiagnostics("LOST_SEARCH_NEGATIVE");
 
     } else {
-      stopMotors();
-      printDiagnostics("STOPPED_NO_LINE_NO_HISTORY");
+      // Changed: move forward instead of remaining stopped.
+      setForwardSpeeds(baseSpeed, baseSpeed);
+      printDiagnostics("SEEKING_LINE_FORWARD");
     }
 
     return;
   }
+
+  // ---------------- Follow detected line ----------------
 
   float error = debugError;
   float errorChange = 0.0f;
