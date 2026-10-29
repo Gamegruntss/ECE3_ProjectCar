@@ -1,138 +1,431 @@
-//PWM Period Experiment
+// LINE FOLLOWING CAR
+// Weighting: (-8, -4, -2, -1, +1, +2, +4, +8) / 4
+//
+// ASSUMPTIONS:
+// 1. Calibration values came from RC discharge times in microseconds.
+// 2. A longer discharge time means the sensor is over the line.
+// 3. Both direction pins LOW drive the car forward.
+// 4. Negative calibrated position means line left; positive means right.
 
-/* This code does the following:
-  - create a PWM signal that runs the left motor
-    - use bumper switch 0 (BMP0) to select from two PWM signal periods
-    - the signal duty cycle is set to 50%
-  - calculate the speed of the left motor using the encoder
-    - this measurement is in arbitrary units (details below)
-  - serial communication sends this information to your computer
-    - serial baud rate is set to 19200 (increased data rate from 9600)
-    - output format is such that the "Serial Plotter" can be used to view data
- */
+// ---------------- Motor pins ----------------
 
-#include <ECE3.h>  // Used for encoder functionality
+const int left_nslp_pin  = 31;
+const int left_dir_pin   = 29;
+const int left_pwm_pin   = 40;
 
-/* NOTE: We use the functions micros() and getEncoderCount_left()
-       - micros()
-           returns how many microseconds it has been since Launchpad startup
-       - getEncoderCount_left()
-           returns how many encoder increments the left wheel has turned
-       - resetEncoderCount_left()
-           sets encoder increments to 0   */
+const int right_nslp_pin = 11;
+const int right_dir_pin  = 30;
+const int right_pwm_pin  = 39;
 
-// Pin Assignments
-const int left_nslp_pin = 31;
-const int left_dir_pin = 29;
-const int left_pwm_pin = 40;
-const int bump_sw_0_pin = 24;
-const int LED_RF = 41;  // LED Red Front
-const int user_sw_2_pin = 74;
+// ---------------- Sensor pins ----------------
 
-// PWM Signal Variables
-bool bump_sw_0_reading;
-bool pwm_state;
-unsigned long set_period;     // Current setting for period (set by BMP0)
-unsigned long t_last_period;  // The time the last period ended
-unsigned long d_period;       // The elapsed time since the current period began
-const double duty_cycle = 0.50;
-const unsigned long long_period = 2000e3;  // 1 s
-const unsigned long short_period = 100e3;  // 100 ms
+// Ordered from left to right.
+const int photoPins[8] = {
+  65, 48, 64, 47, 52, 68, 53, 69
+};
 
-// Encoder Variables
-unsigned long t_enc_cnt_prev;            // The time of at the end of the last bin
-unsigned long enc_bin_cnt;               // The change in encoder count in the last bin (aka motor speed)
-const unsigned long enc_bin_len = 50e3;  // 50 ms bins
-                                         // Encoder Speed Calculation Explanation:
-                                         // We wait for a set amount of time (enc_bin), and find how many
-                                         // times the encoder has incremented in that period. We call
-                                         // this period a bin when refering to the encoder. The number
-                                         // encoder counts per bin is a proportional to speed.
+const float photoWeights[8] = {
+  -8.0f / 4.0f,
+  -4.0f / 4.0f,
+  -2.0f / 4.0f,
+  -1.0f / 4.0f,
+   1.0f / 4.0f,
+   2.0f / 4.0f,
+   4.0f / 4.0f,
+   8.0f / 4.0f
+};
 
-// Misc Variables
-unsigned long curr_micros;  // Stores micros() reading for each execution of loop()
-int user_sw_2_reading;
+// ---------------- IR LEDs ----------------
 
-///////////////////////
+const int IR_LED_odd  = 45;
+const int IR_LED_even = 61;
+
+// ---------------- Sensor settings ----------------
+
+const unsigned long chargeTimeUs = 10;
+
+// Must exceed the longest individual sensor discharge time.
+// 10000 us is a starting setting, not supplied by your calibration.
+const unsigned long sensorTimeoutUs = 10000;
+
+// Starting threshold based on the original code's 2 ms read.
+// Check this against individual readings on the line and background.
+const unsigned long lineThresholdUs = 2000;
+
+// ---------------- Driving settings ----------------
+
+// Assumes the default 8-bit PWM range.
+const int PWM_MAX = 255;
+
+const int baseSpeed    = 65;
+const int turnSpeed    = 85;
+const int searchSpeed  = 55;
+
+const unsigned long timeToTurnMs = 700;
+
+// Set to -1 if the car steers away from the line.
+// With +1, positive position makes the left wheel faster.
+const int steeringSign = 1;
+
+
+// Calibration position is divided by 32 before applying these.
+const float kP = 50.0f;
+const float kD = 150.0f;
+
+const unsigned long controlPeriodUs = 5000;
+
+//End-marker settings 
+
+const int markerSensorCount = 6;
+
+// Require a sustained wide line before counting it.
+const unsigned long markerConfirmMs = 25;
+
+// Require the wide line to clear before another can count.
+const unsigned long markerClearMs = 100;
+
+const int calibrationCount = 17;
+
+const float calibratedPosition[calibrationCount] = {
+  -32, -28, -24, -20, -16, -12, -8, -4,
+    0,
+    4,   8,  12,  16,  20,  24, 28, 32
+};
+
+const float calibratedReading[calibrationCount] = {
+  -2226.719199f,
+  -1560.40039f,
+  -1128.548502
+-725.1264949f,
+-582.3227173f,
+-450.0611413f,
+-304.1680368f,
+-183.219619f,
+83.91175667f,
+298.6762051f,
+401.1685668f,
+607.476123f,
+727.3684738f,
+1090.597989f,
+1388.940946f,
+2301.324419f,
+2122.495693,
+};
+
+//State
+
+unsigned long sensorReading[8];
+
+float previousError = 0.0f;
+float lastSeenError = 0.0f;
+
+bool havePreviousError = false;
+bool stopped = false;
+
+int lineCount = 0;
+
+bool markerArmed = true;
+bool markerTiming = false;
+bool clearTiming = false;
+
+unsigned long markerStartedMs = 0;
+unsigned long clearStartedMs = 0;
+unsigned long previousControlUs = 0;
+
+// Motor helpers
+
+void setForwardSpeeds(int leftSpeed, int rightSpeed) {
+  leftSpeed  = constrain(leftSpeed,  0, PWM_MAX);
+  rightSpeed = constrain(rightSpeed, 0, PWM_MAX);
+
+  digitalWrite(left_dir_pin, LOW);
+  digitalWrite(right_dir_pin, LOW);
+
+  analogWrite(left_pwm_pin, leftSpeed);
+  analogWrite(right_pwm_pin, rightSpeed);
+}
+
+void stopMotors() {
+  analogWrite(left_pwm_pin, 0);
+  analogWrite(right_pwm_pin, 0);
+}
+
+void turnAround() {
+  stopMotors();
+
+  // Reverse the left motor and drive the right motor forward.
+  digitalWrite(left_dir_pin, HIGH);
+  digitalWrite(right_dir_pin, LOW);
+
+  analogWrite(left_pwm_pin, turnSpeed);
+  analogWrite(right_pwm_pin, turnSpeed);
+
+  delay(timeToTurnMs);
+
+  stopMotors();
+
+  digitalWrite(left_dir_pin, LOW);
+  digitalWrite(right_dir_pin, LOW);
+
+  havePreviousError = false;
+  lastSeenError = 0.0f;
+}
+
+// ---------------- Sensor reading ----------------
+
+void readSensors() {
+  bool finished[8];
+
+  // Charge all eight sensor capacitors.
+  for (int i = 0; i < 8; i++) {
+    pinMode(photoPins[i], OUTPUT);
+    digitalWrite(photoPins[i], HIGH);
+
+    sensorReading[i] = sensorTimeoutUs;
+    finished[i] = false;
+  }
+
+  delayMicroseconds(chargeTimeUs);
+
+  // Release the pins and disable internal pull-ups.
+  for (int i = 0; i < 8; i++) {
+    pinMode(photoPins[i], INPUT);
+    digitalWrite(photoPins[i], LOW);
+  }
+
+  unsigned long startedUs = micros();
+  int remaining = 8;
+
+  // Measure how long each pin stays HIGH.
+  while (remaining > 0) {
+    unsigned long elapsedUs = micros() - startedUs;
+
+    if (elapsedUs >= sensorTimeoutUs) {
+      break;
+    }
+
+    for (int i = 0; i < 8; i++) {
+      if (!finished[i] && digitalRead(photoPins[i]) == LOW) {
+        sensorReading[i] = micros() - startedUs;
+        finished[i] = true;
+        remaining--;
+      }
+    }
+  }
+}
+
+float getWeightedReading() {
+  float result = 0.0f;
+
+  for (int i = 0; i < 8; i++) {
+    result += photoWeights[i] * sensorReading[i];
+  }
+
+  return result;
+}
+
+int getLineSensorCount() {
+  int count = 0;
+
+  for (int i = 0; i < 8; i++) {
+    if (sensorReading[i] >= lineThresholdUs) {
+      count++;
+    }
+  }
+
+  return count;
+}
+
+// Convert weighted reading to position using linear interpolation.
+float readingToPosition(float reading) {
+  if (reading <= calibratedReading[0]) {
+    return calibratedPosition[0];
+  }
+
+  if (reading >= calibratedReading[calibrationCount - 1]) {
+    return calibratedPosition[calibrationCount - 1];
+  }
+
+  for (int i = 0; i < calibrationCount - 1; i++) {
+    if (reading <= calibratedReading[i + 1]) {
+      float fraction =
+        (reading - calibratedReading[i]) /
+        (calibratedReading[i + 1] - calibratedReading[i]);
+
+      return calibratedPosition[i] +
+        fraction *
+        (calibratedPosition[i + 1] - calibratedPosition[i]);
+    }
+  }
+
+  return 0.0f;
+}
+
+// End-marker detection
+
+// Returns true if this loop should skip normal steering.
+bool handleMarker(int sensorCount) {
+  unsigned long nowMs = millis();
+
+  if (sensorCount >= markerSensorCount) {
+    clearTiming = false;
+
+    if (!markerArmed) {
+      // Continue through the marker without counting it again.
+      setForwardSpeeds(baseSpeed, baseSpeed);
+      havePreviousError = false;
+      return true;
+    }
+
+    if (!markerTiming) {
+      markerTiming = true;
+      markerStartedMs = nowMs;
+    }
+
+    if (nowMs - markerStartedMs >= markerConfirmMs) {
+      lineCount++;
+
+      markerArmed = false;
+      markerTiming = false;
+
+      if (lineCount == 1) {
+        turnAround();
+      } else {
+        stopped = true;
+        stopMotors();
+      }
+
+      return true;
+    }
+
+    setForwardSpeeds(baseSpeed, baseSpeed);
+    havePreviousError = false;
+    return true;
+  }
+
+  markerTiming = false;
+
+  if (!markerArmed) {
+    if (!clearTiming) {
+      clearTiming = true;
+      clearStartedMs = nowMs;
+    }
+
+    if (nowMs - clearStartedMs >= markerClearMs) {
+      markerArmed = true;
+      clearTiming = false;
+    }
+  }
+
+  return false;
+}
+
+// Setup
+
 void setup() {
-  // This function runs once
-
-  // Pin Settings
   pinMode(left_nslp_pin, OUTPUT);
   pinMode(left_dir_pin, OUTPUT);
   pinMode(left_pwm_pin, OUTPUT);
-  pinMode(bump_sw_0_pin, INPUT_PULLUP);
-  pinMode(LED_RF, OUTPUT);
-  pinMode(user_sw_2_pin, INPUT_PULLUP);
 
+  pinMode(right_nslp_pin, OUTPUT);
+  pinMode(right_dir_pin, OUTPUT);
+  pinMode(right_pwm_pin, OUTPUT);
 
-  // Setting Initial Values
-  //digitalWrite(left_nslp_pin, HIGH); // we don't set this since we want the motor to coast
-  // NOTE: For the purposes of this experiment, we drive
-  //       left_nslp_pin with a PWM signal as well. This
-  //       allows the motor to coast, rather than brake,
-  //       when the PWM signal is low. This only matters
-  //       for large periods.
+  digitalWrite(left_nslp_pin, HIGH);
+  digitalWrite(right_nslp_pin, HIGH);
+
   digitalWrite(left_dir_pin, LOW);
+  digitalWrite(right_dir_pin, LOW);
 
-  t_last_period = micros();
+  stopMotors();
 
-  ECE3_Init();  // Used for encoder functionality
-  resetEncoderCount_left();
-  enc_bin_cnt = 0;
-  t_enc_cnt_prev = micros();
+  pinMode(IR_LED_odd, OUTPUT);
+  pinMode(IR_LED_even, OUTPUT);
 
-  Serial.begin(19200);  // Higher baud rate than default: 9600
-
-  delay(2000);  // Wait 2 seconds before starting
+  digitalWrite(IR_LED_odd, HIGH);
+  digitalWrite(IR_LED_even, HIGH);
 }
 
+// Main loop
 void loop() {
-  // This function loops forever
-  user_sw_2_reading = digitalRead(user_sw_2_pin);
-  // Determine set_period from BMP0
-  bump_sw_0_reading = digitalRead(bump_sw_0_pin);
-  if (bump_sw_0_reading)
-    //  if(user_sw_2_reading)
-    set_period = long_period;
-  else
-    set_period = short_period;
-
-  // Determine where in a period we are
-  curr_micros = micros();
-  d_period = curr_micros - t_last_period;
-
-  // Set the PWM signal state
-  pwm_state = d_period < set_period * duty_cycle;
-
-  // Write the PWM signal state to the left motor
-  digitalWrite(left_nslp_pin, pwm_state);  // as noted before, this allows the left motor to coast
-  digitalWrite(left_pwm_pin, pwm_state);
-  digitalWrite(LED_RF, pwm_state);
-
-  // Check if the period has ended
-  if (d_period > set_period)
-    t_last_period = curr_micros;
-
-
-
-  // Encoder Speed Calculation (SEE EXPLANATION AT VARIABLE DECLARATIONS)
-  if (curr_micros - t_enc_cnt_prev > enc_bin_len) {  // have we finished a bin?
-    enc_bin_cnt = getEncoderCount_left();            // find encoder ticks in the recent bin (calculate speed)
-
-    resetEncoderCount_left();
-    t_enc_cnt_prev = curr_micros;
+  if (stopped) {
+    stopMotors();
+    return;
   }
 
+  unsigned long nowUs = micros();
+  unsigned long elapsedUs = nowUs - previousControlUs;
 
+  if (elapsedUs < controlPeriodUs) {
+    return;
+  }
 
-  // Print to the Serial Plotter
-  Serial.print(255 * pwm_state);
-  Serial.print(",");
-  Serial.print(-50);
-  Serial.print(",");
-  Serial.print(300);
-  Serial.print(",");
-  // scaling up pwm_state by 255 so it is visible on the same plot as enc_cnt_diff
-  Serial.println(enc_bin_cnt);
+  previousControlUs = nowUs;
+
+  readSensors();
+
+  int sensorCount = getLineSensorCount();
+
+  if (handleMarker(sensorCount)) {
+    return;
+  }
+
+  // Lost the line: turn toward the last known line position.
+  if (sensorCount == 0) {
+    if (lastSeenError > 0.0f) {
+      if (steeringSign > 0) {
+        setForwardSpeeds(searchSpeed, 0);
+      } else {
+        setForwardSpeeds(0, searchSpeed);
+      }
+    } else if (lastSeenError < 0.0f) {
+      if (steeringSign > 0) {
+        setForwardSpeeds(0, searchSpeed);
+      } else {
+        setForwardSpeeds(searchSpeed, 0);
+      }
+    } else {
+      // No previous direction is available.
+      stopMotors();
+    }
+
+    havePreviousError = false;
+    return;
+  }
+
+  float weightedReading = getWeightedReading();
+  float position = readingToPosition(weightedReading);
+
+  // Normalize calibrated position to approximately -1 ... +1.
+  // The measured centre offset is already handled by interpolation.
+  float error = position / 32.0f;
+
+  float errorChange = 0.0f;
+
+  if (havePreviousError) {
+    // Scale to a nominal 5 ms update interval.
+    errorChange = (error - previousError) *
+      ((float)controlPeriodUs / (float)elapsedUs);
+  }
+
+  float correction =
+    steeringSign * (kP * error + kD * errorChange);
+
+  correction = constrain(
+    correction,
+    -(float)baseSpeed,
+     (float)baseSpeed
+  );
+
+  int leftSpeed  = (int)(baseSpeed + correction);
+  int rightSpeed = (int)(baseSpeed - correction);
+
+  setForwardSpeeds(leftSpeed, rightSpeed);
+
+  previousError = error;
+  havePreviousError = true;
+
+  if (error > 0.02f || error < -0.02f) {
+    lastSeenError = error;
+  }
 }
