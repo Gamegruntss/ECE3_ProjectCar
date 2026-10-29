@@ -1,4 +1,4 @@
-// SIMPLE CALIBRATED LINE FOLLOWER
+#include <ECE3.h>
 
 // ---------------- Motor pins ----------------
 
@@ -10,37 +10,37 @@ const int rightSleep = 11;
 const int rightDir   = 30;
 const int rightPWM   = 39;
 
-// ---------------- Sensor pins ----------------
-
-// Left to right
-const int sensorPins[8] = {
-  65, 48, 64, 47, 52, 68, 53, 69
-};
-
-// (-8, -4, -2, -1, +1, +2, +4, +8) / 4
-const float weights[8] = {
-  -2.0f, -1.0f, -0.5f, -0.25f,
-   0.25f, 0.5f, 1.0f, 2.0f
-};
-
-const int oddLED  = 45;
-const int evenLED = 61;
-
 // ---------------- Driving settings ----------------
 
 const int baseSpeed = 65;
 
-// Motor correction per unit of calibrated position.
-// At position +20, correction = 40.
-const float steeringGain = 2.0f;
+// PWM correction per unit of calibrated error.
+const float kP = 2.0f;
 
-// Change to -1 if the car steers away from the line.
+// Change to -1 if the car turns away from the line.
 const int steeringSign = 1;
 
-const unsigned long timeoutUs = 10000;
+// ---------------- Sensors ----------------
+
+uint16_t sensorValues[8];
+float averagedSensors[8];
+
+// Keep the SAME sensor order returned during calibration.
+const float weights[8] = {
+  -8.0f / 4.0f,
+  -4.0f / 4.0f,
+  -2.0f / 4.0f,
+  -1.0f / 4.0f,
+   1.0f / 4.0f,
+   2.0f / 4.0f,
+   4.0f / 4.0f,
+   8.0f / 4.0f
+};
 
 // ---------------- Your calibration ----------------
 
+// Use the increasing section of your calibration.
+// The +32 reading folds back below the +28 reading.
 const int calibrationCount = 16;
 
 const float positions[calibrationCount] = {
@@ -67,12 +67,13 @@ const float calibration[calibrationCount] = {
    2301.324419f
 };
 
-unsigned long readings[8];
-
 // ---------------- Setup ----------------
 
 void setup() {
-  Serial.begin(115200);
+  // Use the SAME initialization as your calibration sketch.
+  ECE3_Init();
+
+  Serial.begin(9600);
 
   pinMode(leftSleep, OUTPUT);
   pinMode(leftDir, OUTPUT);
@@ -91,65 +92,43 @@ void setup() {
   digitalWrite(leftSleep, HIGH);
   digitalWrite(rightSleep, HIGH);
 
-  pinMode(oddLED, OUTPUT);
-  pinMode(evenLED, OUTPUT);
-
-  digitalWrite(oddLED, HIGH);
-  digitalWrite(evenLED, HIGH);
+  delay(1000);
 }
 
 // ---------------- Read sensors ----------------
 
-void readSensors() {
-  bool finished[8];
+void readAveragedSensors() {
+  uint32_t sums[8] = {0};
 
-  // Charge all sensors.
-  for (int i = 0; i < 8; i++) {
-    pinMode(sensorPins[i], OUTPUT);
-    digitalWrite(sensorPins[i], HIGH);
+  // Same five-sample averaging as your calibration.
+  for (int sample = 0; sample < 5; sample++) {
+    ECE3_read_IR(sensorValues);
 
-    readings[i] = timeoutUs;
-    finished[i] = false;
-  }
-
-  delayMicroseconds(10);
-
-  // Release sensors and disable pull-ups.
-  for (int i = 0; i < 8; i++) {
-    pinMode(sensorPins[i], INPUT);
-    digitalWrite(sensorPins[i], LOW);
-  }
-
-  unsigned long start = micros();
-  int remaining = 8;
-
-  // Measure how long each sensor stays HIGH.
-  while (remaining > 0 && micros() - start < timeoutUs) {
     for (int i = 0; i < 8; i++) {
-      if (!finished[i] && digitalRead(sensorPins[i]) == LOW) {
-        readings[i] = micros() - start;
-        finished[i] = true;
-        remaining--;
-      }
+      sums[i] += sensorValues[i];
     }
+  }
+
+  for (int i = 0; i < 8; i++) {
+    averagedSensors[i] = sums[i] / 5.0f;
   }
 }
 
-// ---------------- Calibration lookup ----------------
+// ---------------- Convert reading to error ----------------
 
-float getPosition(float weightedReading) {
-  if (weightedReading <= calibration[0]) {
+float getCalibratedError(float reading) {
+  if (reading <= calibration[0]) {
     return positions[0];
   }
 
-  if (weightedReading >= calibration[calibrationCount - 1]) {
+  if (reading >= calibration[calibrationCount - 1]) {
     return positions[calibrationCount - 1];
   }
 
   for (int i = 0; i < calibrationCount - 1; i++) {
-    if (weightedReading <= calibration[i + 1]) {
+    if (reading <= calibration[i + 1]) {
       float fraction =
-        (weightedReading - calibration[i]) /
+        (reading - calibration[i]) /
         (calibration[i + 1] - calibration[i]);
 
       return positions[i] +
@@ -160,22 +139,23 @@ float getPosition(float weightedReading) {
   return 0.0f;
 }
 
-// ---------------- Follow the line ----------------
+// ---------------- Main loop ----------------
 
 void loop() {
-  readSensors();
+  readAveragedSensors();
 
-  // Calculate the same weighted sum used for calibration.
+  // Apply your 8-4-2-1 weighting.
   float weightedReading = 0.0f;
 
   for (int i = 0; i < 8; i++) {
-    weightedReading += weights[i] * readings[i];
+    weightedReading += weights[i] * averagedSensors[i];
   }
 
-  // Desired position is zero, so position is the error.
-  float error = getPosition(weightedReading);
+  // Your calibration maps weighted reading to position error.
+  float error = getCalibratedError(weightedReading);
 
-  float correction = steeringSign * steeringGain * error;
+  // Simple proportional steering.
+  float correction = steeringSign * kP * error;
 
   correction = constrain(
     correction,
@@ -183,15 +163,13 @@ void loop() {
      (float)baseSpeed
   );
 
-  // Positive error -> turn right.
-  // Negative error -> turn left.
   int leftSpeed  = (int)(baseSpeed + correction);
   int rightSpeed = (int)(baseSpeed - correction);
 
   analogWrite(leftPWM, leftSpeed);
   analogWrite(rightPWM, rightSpeed);
 
-  // Print diagnostics every 500 ms.
+  // Diagnostics every half second.
   static unsigned long lastPrint = 0;
 
   if (millis() - lastPrint >= 500) {
@@ -200,22 +178,19 @@ void loop() {
     Serial.print("Sensors: ");
 
     for (int i = 0; i < 8; i++) {
-      Serial.print(readings[i]);
+      Serial.print(averagedSensors[i], 0);
       Serial.print(" ");
     }
 
     Serial.print("| Weighted: ");
-    Serial.print(weightedReading, 2);
+    Serial.print(weightedReading, 1);
 
     Serial.print(" | Error: ");
-    Serial.print(error, 2);
+    Serial.print(error, 1);
 
-    Serial.print(" | Left: ");
+    Serial.print(" | Motors: ");
     Serial.print(leftSpeed);
-
-    Serial.print(" | Right: ");
+    Serial.print(" ");
     Serial.println(rightSpeed);
   }
-
-  delay(2);
 }
