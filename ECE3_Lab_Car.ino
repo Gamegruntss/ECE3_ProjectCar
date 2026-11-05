@@ -10,8 +10,8 @@ const int rightPWM = 39;
 
 // Start with the steering sign that worked on the straight track.
 const int steeringSign = -1;
-const int straightPWM = 50;
-const int cornerPWM = 32;
+const int baseSpeed = 50;
+const int cornerSpeed = 32;
 const int maxPWM = 100;
 const float kP = 2.0f;
 const float kD = 0.04f;  // Error rate is measured per second.
@@ -30,7 +30,7 @@ const float centerOffset = 1.04f;  // Centroid measured on the sheet's zero row.
 const float noiseFloor = 0.10f;
 const float lineThreshold = 0.20f;
 
-const int searchPWM = 45;
+const int searchSpeed = 45;
 const unsigned long searchLimitMs = 700;
 const bool diagnostics = false;  // Set true to print peak, error and motor commands.
 
@@ -113,8 +113,8 @@ void loop() {
   const bool lineVisible = readLine(error, peak);
   const unsigned long nowUs = micros();
   const unsigned long nowMs = millis();
-  int left = 0;
-  int right = 0;
+  int leftSpeed = 0;
+  int rightSpeed = 0;
 
   if (lineVisible) {
     if (fabsf(error) > 3.0f) {
@@ -132,24 +132,25 @@ void loop() {
     
 
     const float turnFraction = constrain(fabsf(error) / 25.0f, 0.0f, 1.0f);
-    const float base = straightPWM - (straightPWM - cornerPWM) * turnFraction;
+    const float base = baseSpeed - (baseSpeed - cornerSpeed) * turnFraction;
     const float damping = constrain(kD * filteredRate, -18.0f, 18.0f);
     const float turn = steeringSign * (kP * error + damping);
 
-    left = (int)(base + turn);
-    right = (int)(base - turn);
+    leftSpeed = (int)(base + turn);
+    rightSpeed = (int)(base - turn);
+
     lastError = error;
     lastSampleUs = nowUs;
     lastSeenMs = nowMs;
   } else if (lastLineSide != 0 && nowMs - lastSeenMs < searchLimitMs) {
     // Pivot in the direction the last visible line called for.
-    left = steeringSign * lastLineSide * searchPWM;
-    right = -left;
+    leftSpeed = steeringSign * lastLineSide * searchSpeed;
+    rightSpeed = -leftSpeed;
   }
 
   trackedLastFrame = lineVisible;
-  writeMotor(leftPWM, leftDir, left);
-  writeMotor(rightPWM, rightDir, right);
+  writeMotor(leftPWM, leftDir, leftSpeed);
+  writeMotor(rightPWM, rightDir, rightSpeed);
 
   if (diagnostics) {
     static unsigned long lastPrint = 0;
