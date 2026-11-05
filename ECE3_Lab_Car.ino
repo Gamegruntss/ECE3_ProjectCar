@@ -15,7 +15,7 @@ const int rightPWM   = 39;
 const int baseSpeed = 50;
 
 // PWM correction per unit of calibrated error.
-const float kP = 1.5f;
+const float kP = 0.5f;
 
 // Change to -1 if the car turns away from the line.
 const int steeringSign = -1;
@@ -91,8 +91,6 @@ void setup() {
 
   digitalWrite(leftSleep, HIGH);
   digitalWrite(rightSleep, HIGH);
-
-  delay(1000);
 }
 
 // ---------------- Read sensors ----------------
@@ -168,29 +166,4 @@ void loop() {
 
   analogWrite(leftPWM, leftSpeed);
   analogWrite(rightPWM, rightSpeed);
-
-  // Diagnostics every half second.
-  //static unsigned long lastPrint = 0;
-
-  // if (millis() - lastPrint >= 500) {
-  //   lastPrint = millis();
-
-  //   Serial.print("Sensors: ");
-
-  //   for (int i = 0; i < 8; i++) {
-  //     Serial.print(averagedSensors[i], 0);
-  //     Serial.print(" ");
-  //   }
-
-  //   Serial.print("| Weighted: ");
-  //   Serial.print(weightedReading, 1);
-
-  //   Serial.print(" | Error: ");
-  //   Serial.print(error, 1);
-
-  //   Serial.print(" | Motors: ");
-  //   Serial.print(leftSpeed);
-  //   Serial.print(" ");
-  //   Serial.println(rightSpeed);
-  // }
 }
