@@ -134,6 +134,13 @@ void loop() {
   int rightSpeed = 0;
 
   const bool onBar = blackSensors >= 7;
+  static bool wasOnBar = false;
+
+  if (onBar && !wasOnBar) {
+    Serial.print("BAR DETECTED | Black sensors: ");
+    Serial.println(blackSensors);
+  }
+  wasOnBar = onBar;
   const bool centeredLine = lineVisible && blackSensors <= 3 && fabsf(error) <= 8.0f;
 
   if (phase == LEAVING_START) {
