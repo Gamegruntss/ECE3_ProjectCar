@@ -1,169 +1,160 @@
 #include <ECE3.h>
-
-// ---------------- Motor pins ----------------
+#include <math.h>
 
 const int leftSleep = 31;
-const int leftDir   = 29;
-const int leftPWM   = 40;
-
+const int leftDir = 29;
+const int leftPWM = 40;
 const int rightSleep = 11;
-const int rightDir   = 30;
-const int rightPWM   = 39;
+const int rightDir = 30;
+const int rightPWM = 39;
 
-// ---------------- Driving settings ----------------
-
-const int baseSpeed = 50;
-
-// PWM correction per unit of calibrated error.
-const float kP = 0.5f;
-
-// Change to -1 if the car turns away from the line.
+// Start with the steering sign that worked on the straight track.
 const int steeringSign = -1;
+const int straightPWM = 50;
+const int cornerPWM = 32;
+const int maxPWM = 100;
+const float kP = 2.0f;
+const float kD = 0.04f;  // Error rate is measured per second.
+const float derivativeFilterSeconds = 0.035f; 
 
-// ---------------- Sensors ----------------
-
-uint16_t sensorValues[8];
-float averagedSensors[8];
-
-// Keep the SAME sensor order returned during calibration.
-const float weights[8] = {
-  -8.0f / 4.0f,
-  -4.0f / 4.0f,
-  -2.0f / 4.0f,
-  -1.0f / 4.0f,
-   1.0f / 4.0f,
-   2.0f / 4.0f,
-   4.0f / 4.0f,
-   8.0f / 4.0f
+// Calibrated S1 through S8, in ECE3_read_IR order.
+const float sensorMin[8] = {
+  749.75f, 646.25f, 669.25f, 549.75f, 645.75f, 634.50f, 697.25f, 782.50f
 };
-
-// ---------------- Your calibration ----------------
-
-// Use the increasing section of your calibration.
-// The +32 reading folds back below the +28 reading.
-const int calibrationCount = 16;
-
-const float positions[calibrationCount] = {
-  -32, -28, -24, -20, -16, -12, -8, -4,
-    0,   4,   8,  12,  16,  20, 24, 28
+const float sensorSpan[8] = {
+  1750.25f, 1840.00f, 1830.75f, 947.50f, 1450.50f, 1851.50f, 1802.75f, 1717.50f
 };
+// Relative positions across the sensor bar, in calibration position units.
+const float sensorPosition[8] = {-35, -25, -15, -5, 5, 15, 25, 35};
+const float centerOffset = 1.04f;  // Centroid measured on the sheet's zero row.
+const float noiseFloor = 0.10f;
+const float lineThreshold = 0.20f;
 
-const float calibration[calibrationCount] = {
-  -2226.719199f,
-  -1560.400390f,
-  -1128.548502f,
-   -725.1264949f,
-   -582.3227173f,
-   -450.0611413f,
-   -304.1680368f,
-   -183.2196190f,
-     83.91175667f,
-    298.6762051f,
-    401.1685668f,
-    607.4761230f,
-    727.3684738f,
-   1090.597989f,
-   1388.940946f,
-   2301.324419f
-};
+const int searchPWM = 45;
+const unsigned long searchLimitMs = 700;
+const bool diagnostics = false;  // Set true to print peak, error and motor commands.
 
-// ---------------- Setup ----------------
+uint16_t rawSensors[8];
+float lastError = 0.0f;
+float filteredRate = 0.0f;
+int lastLineSide = 0;
+bool trackedLastFrame = false;
+unsigned long lastSeenMs = 0;
+unsigned long lastSampleUs = 0;
+
+void writeMotor(int pwmPin, int dirPin, int speed) {
+  speed = constrain(speed, -maxPWM, maxPWM);
+  if (speed == 0) {
+    analogWrite(pwmPin, 0);
+    return;
+  }
+
+  const int direction = speed < 0 ? HIGH : LOW;
+  if (digitalRead(dirPin) != direction) {
+    analogWrite(pwmPin, 0);
+    digitalWrite(dirPin, direction);
+  }
+  analogWrite(pwmPin, abs(speed));
+}
+
+bool readLine(float &error, float &peak) {
+  ECE3_read_IR(rawSensors);
+  float total = 0.0f;
+  float weighted = 0.0f;
+  peak = 0.0f;
+
+  for (int i = 0; i < 8; ++i) {
+    const float strength =
+      constrain((rawSensors[i] - sensorMin[i]) / sensorSpan[i], 0.0f, 1.0f);
+    if (strength > peak) {
+      peak = strength;
+    }
+
+    if (strength > noiseFloor) {
+      const float weight = strength - noiseFloor;
+      total += weight;
+      weighted += weight * sensorPosition[i];
+    }
+  }
+
+  if (peak < lineThreshold) {
+    return false;
+  }
+
+  error = weighted / total - centerOffset;
+  return true;
+}
 
 void setup() {
-  // Use the SAME initialization as your calibration sketch.
   ECE3_Init();
-
-  Serial.begin(9600);
+  if (diagnostics) {
+    Serial.begin(115200);
+  }
 
   pinMode(leftSleep, OUTPUT);
   pinMode(leftDir, OUTPUT);
   pinMode(leftPWM, OUTPUT);
-
   pinMode(rightSleep, OUTPUT);
   pinMode(rightDir, OUTPUT);
   pinMode(rightPWM, OUTPUT);
 
   analogWrite(leftPWM, 0);
   analogWrite(rightPWM, 0);
-
   digitalWrite(leftDir, LOW);
   digitalWrite(rightDir, LOW);
-
   digitalWrite(leftSleep, HIGH);
   digitalWrite(rightSleep, HIGH);
+  delay(1000);
 }
-
-// ---------------- Read sensors ----------------
-
-void readAveragedSensors() {
-  uint32_t sums[8] = {0};
-
-  // Same five-sample averaging as your calibration.
-  for (int sample = 0; sample < 5; sample++) {
-    ECE3_read_IR(sensorValues);
-
-    for (int i = 0; i < 8; i++) {
-      sums[i] += sensorValues[i];
-    }
-  }
-
-  for (int i = 0; i < 8; i++) {
-    averagedSensors[i] = sums[i] / 5.0f;
-  }
-}
-
-// ---------------- Convert reading to error ----------------
-
-float getCalibratedError(float reading) {
-  if (reading <= calibration[0]) {
-    return positions[0];
-  }
-
-  if (reading >= calibration[calibrationCount - 1]) {
-    return positions[calibrationCount - 1];
-  }
-
-  for (int i = 0; i < calibrationCount - 1; i++) {
-    if (reading <= calibration[i + 1]) {
-      float fraction =
-        (reading - calibration[i]) /
-        (calibration[i + 1] - calibration[i]);
-
-      return positions[i] +
-        fraction * (positions[i + 1] - positions[i]);
-    }
-  }
-
-  return 0.0f;
-}
-
-// ---------------- Main loop ----------------
 
 void loop() {
-  readAveragedSensors();
+  float error = 0.0f;
+  float peak = 0.0f;
+  const bool lineVisible = readLine(error, peak);
+  const unsigned long nowUs = micros();
+  const unsigned long nowMs = millis();
+  int left = 0;
+  int right = 0;
 
-  // Apply your 8-4-2-1 weighting.
-  float weightedReading = 0.0f;
+  if (lineVisible) {
+    if (fabsf(error) > 3.0f) {
+      lastLineSide = error > 0.0f ? 1 : -1;
+    }
 
-  for (int i = 0; i < 8; i++) {
-    weightedReading += weights[i] * averagedSensors[i];
+    const float dt = (nowUs - lastSampleUs) * 1.0e-6f;
+    if (trackedLastFrame && dt > 0.0f) {
+      const float rate = (error - lastError) / dt;
+      const float alpha = dt / (derivativeFilterSeconds + dt);
+      filteredRate += alpha * (rate - filteredRate);
+    } else {
+      filteredRate = 0.0f;
+    }
+    
+
+    const float turnFraction = constrain(fabsf(error) / 25.0f, 0.0f, 1.0f);
+    const float base = straightPWM - (straightPWM - cornerPWM) * turnFraction;
+    const float damping = constrain(kD * filteredRate, -18.0f, 18.0f);
+    const float turn = steeringSign * (kP * error + damping);
+
+    left = (int)(base + turn);
+    right = (int)(base - turn);
+    lastError = error;
+    lastSampleUs = nowUs;
+    lastSeenMs = nowMs;
+  } else if (lastLineSide != 0 && nowMs - lastSeenMs < searchLimitMs) {
+    // Pivot in the direction the last visible line called for.
+    left = steeringSign * lastLineSide * searchPWM;
+    right = -left;
   }
 
-  // Your calibration maps weighted reading to position error.
-  float error = getCalibratedError(weightedReading);
+  trackedLastFrame = lineVisible;
+  writeMotor(leftPWM, leftDir, left);
+  writeMotor(rightPWM, rightDir, right);
 
-  // Simple proportional steering.
-  float correction = steeringSign * kP * error;
-
-  correction = constrain(
-    correction,
-    -(float)baseSpeed,
-     (float)baseSpeed
-  );
-
-  int leftSpeed  = (int)(baseSpeed + correction);
-  int rightSpeed = (int)(baseSpeed - correction);
-
-  analogWrite(leftPWM, leftSpeed);
-  analogWrite(rightPWM, rightSpeed);
+  if (diagnostics) {
+    static unsigned long lastPrint = 0;
+    if (nowMs - lastPrint >= 100) {
+      lastPrint = nowMs;
+    }
+  }
 }
