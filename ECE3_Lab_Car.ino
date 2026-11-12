@@ -17,6 +17,12 @@ const float kP = 2.0f;
 const float kD = 0.04f;  // Error rate is measured per second.
 const float derivativeFilterSeconds = 0.035f; 
 
+const int blackThreshold = 2400;
+const int minBlackSensors = 6;
+
+int consecutiveBlackFrames = 0;
+bool uTurnActive = false;
+
 // Calibrated S1 through S8, in ECE3_read_IR order.
 const float sensorMin[8] = {
   749.75f, 646.25f, 669.25f, 549.75f, 645.75f, 634.50f, 697.25f, 782.50f
@@ -42,19 +48,6 @@ bool trackedLastFrame = false;
 unsigned long lastSeenMs = 0;
 unsigned long lastSampleUs = 0;
 
-
-enum TrackPhase { LEAVING_START, OUTBOUND, TURNING, RETURNING, STOPPED };
-TrackPhase phase = LEAVING_START;
-int blackSensors = 0;
-int barFrames = 0;
-unsigned long turnStarted = 0;
-bool turnSawGap = false;
-const int turnPWM = 55;
-const unsigned long minTurnMs = 300;
-const unsigned long turnTimeoutMs = 2000;
-
-
-
 void writeMotor(int pwmPin, int dirPin, int speed) {
   speed = constrain(speed, -maxPWM, maxPWM);
   if (speed == 0) {
@@ -70,21 +63,29 @@ void writeMotor(int pwmPin, int dirPin, int speed) {
   analogWrite(pwmPin, abs(speed));
 }
 
+bool detectBlackBar() {
+  int blackCount = 0;
+
+  for (int i = 0; i < 8; i++) {
+    if (rawSensors[i] >= blackThreshold) {
+      blackCount++;
+    }
+  }
+
+  return blackCount >= minBlackSensors;
+}
+
 bool readLine(float &error, float &peak) {
   ECE3_read_IR(rawSensors);
   float total = 0.0f;
   float weighted = 0.0f;
   peak = 0.0f;
-  blackSensors = 0;
 
   for (int i = 0; i < 8; ++i) {
     const float strength =
       constrain((rawSensors[i] - sensorMin[i]) / sensorSpan[i], 0.0f, 1.0f);
     if (strength > peak) {
       peak = strength;
-    }
-    if(strength>=0.55f){
-      blackSensors++;
     }
 
     if (strength > noiseFloor) {
@@ -128,74 +129,20 @@ void loop() {
   float error = 0.0f;
   float peak = 0.0f;
   const bool lineVisible = readLine(error, peak);
+  
+  if (detectBlackBar()) {
+  consecutiveBlackFrames++;
+} else {
+  consecutiveBlackFrames = 0;
+}
+
+if (consecutiveBlackFrames >= 2) {
+  uTurnActive = true;
+}
   const unsigned long nowUs = micros();
   const unsigned long nowMs = millis();
   int leftSpeed = 0;
   int rightSpeed = 0;
-
-  const bool onBar = blackSensors >= 7;
-  static bool wasOnBar = false;
-
-  if (onBar && !wasOnBar) {
-    Serial.print("BAR DETECTED | Black sensors: ");
-    Serial.println(blackSensors);
-  }
-  wasOnBar = onBar;
-  const bool centeredLine = lineVisible && blackSensors <= 3 && fabsf(error) <= 8.0f;
-
-  if (phase == LEAVING_START) {
-    if (onBar) {
-      // Drive straight off the starting bar.
-      writeMotor(leftPWM, leftDir, cornerPWM);
-      writeMotor(rightPWM, rightDir, cornerPWM);
-      return;
-    }
-    if (centeredLine) {
-      phase = OUTBOUND;
-    }
-  }
-
-  if (phase == OUTBOUND || phase == RETURNING) {
-    barFrames = onBar ? barFrames + 1 : 0;
-
-    if (barFrames >= 2) {
-      barFrames = 0;
-      if (phase == OUTBOUND) {
-        phase = TURNING;
-        turnStarted = nowMs;
-        turnSawGap = false;
-      } else {
-        phase = STOPPED;
-      }
-    }
-  }
-
-  if (phase == TURNING) {
-    const unsigned long elapsed = nowMs - turnStarted;
-
-    if (!lineVisible) {
-      turnSawGap = true;
-    }
-
-    if (elapsed >= turnTimeoutMs) {
-      phase = STOPPED;
-    } else if (elapsed >= minTurnMs && turnSawGap && centeredLine) {
-      phase = RETURNING;
-      trackedLastFrame = false;
-      lastLineSide = 0;
-    } else {
-      // One wheel forward, one backward.
-      writeMotor(leftPWM, leftDir, turnPWM);
-      writeMotor(rightPWM, rightDir, -turnPWM);
-      return;
-    }
-  }
-
-  if (phase == STOPPED) {
-    writeMotor(leftPWM, leftDir, 0);
-    writeMotor(rightPWM, rightDir, 0);
-    return;
-  }
 
   if (lineVisible) {
     if (fabsf(error) > 3.0f) {
