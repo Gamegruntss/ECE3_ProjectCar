@@ -13,11 +13,22 @@ const int oddLed = 61;
 
 // ======================= Speed =======================
 const int steeringSign = -1;
-const int straightSpeed = 150;      // centred on a straight
-const int cornerSpeed   = 40;       // base speed in the tightest turns
+const int straightSpeed = 155;      // centred on a straight
+const int cornerSpeed   = 48;       // base speed in the tightest turns (was 40)
 const float slowDownError = 18.0f;  // line this far off-centre -> cornerSpeed
 const float slowDownRate  = 300.0f; // line moving this fast    -> cornerSpeed (brakes before the error gets big)
-const float accelPerSec   = 600.0f; // speed climbs back gradually, brakes instantly
+const float accelPerSec   = 700.0f; // speed climbs back gradually, brakes instantly
+
+// Line slips off the sensors (only at sharp corners / the tip): turn on the
+// spot toward the side where the line was LAST seen at the edge of the
+// sensor bar. At the tip the new line always shows up on the outer sensors
+// of the correct side before the old line ends, so this is always right.
+const int lostTurnPWM = 95;
+const int twoLineSpeed = 40;   // base speed while two lines are in view (V corner)
+// Only counts as a V corner if two lines stay in view this long. Driving onto
+// the bar at a slight angle shows "two lines" for just a few ms - the car must
+// NOT slow or steer toward the bar's corner then, it must drive straight across.
+const unsigned long twoLineConfirmMs = 40;
 const int maxPWM = 235;
 
 // ======================= Steering =======================
@@ -40,11 +51,12 @@ const unsigned long barClearMs = 65;
 const int clearSpeed = 70;
 
 // Bar = all 8 sensors black for 3 readings AND the car was centred on a
-// normal line just before (a corner always pulls the line to one side first).
+// normal line shortly before (a sharp corner pulls the line far off-centre
+// first, so it can't pass).
 const float barStrength = 0.60f;
 const int barConfirmFrames = 3;
 const float barCenteredError = 10.0f;
-const unsigned long barCenteredWithinMs = 60;
+const unsigned long barCenteredWithinMs = 150;
 
 // ======================= Calibration =======================
 const float sensorMin[8] = {
@@ -72,6 +84,7 @@ bool clearingOnGuide = false;
 unsigned long clearStartedMs = 0;
 
 uint16_t rawSensors[8];
+int lineGroups = 0;              // separate dark lines under the sensors
 int darkCount = 0;
 int barFrames = 0;
 unsigned long lastCenteredMs = 0;
@@ -80,6 +93,8 @@ float lastError = 0.0f;
 float filteredRate = 0.0f;
 bool trackedLastFrame = false;
 float currentBase = cornerSpeed;
+int lastEdgeSide = 0;
+unsigned long twoLineSinceMs = 0;   // -1 / +1 (error sign) of the last line seen on an outer sensor
 unsigned long lastSampleUs = 0;
 unsigned long lastFollowUs = 0;
 
@@ -110,11 +125,20 @@ bool readLine(float &error, float &centerStrength) {
   float peak = 0.0f;
   float s3 = 0.0f;
   float s4 = 0.0f;
+  bool prevOn = false;
+  float s0 = 0.0f, s1 = 0.0f, s6 = 0.0f, s7 = 0.0f;
   darkCount = 0;
+  lineGroups = 0;
 
   for (int i = 0; i < 8; ++i) {
     const float s =
       constrain((rawSensors[i] - sensorMin[i]) / sensorSpan[i], 0.0f, 1.0f);
+    if (s >= lineThreshold && !prevOn) ++lineGroups;
+    prevOn = s >= lineThreshold;
+    if (i == 0) s0 = s;
+    if (i == 1) s1 = s;
+    if (i == 6) s6 = s;
+    if (i == 7) s7 = s;
     if (i == 3) s3 = s;
     if (i == 4) s4 = s;
     if (s > peak) peak = s;
@@ -125,6 +149,12 @@ bool readLine(float &error, float &centerStrength) {
     }
   }
   centerStrength = s3 > s4 ? s3 : s4;
+
+  // Outer two sensors on each side. Only one side dark = the line (or a
+  // new branch) is out on that side.
+  const bool negEdge = s0 >= lineThreshold || s1 >= lineThreshold;
+  const bool posEdge = s6 >= lineThreshold || s7 >= lineThreshold;
+  if (negEdge != posEdge) lastEdgeSide = posEdge ? 1 : -1;
 
   if (peak < lineThreshold || total <= 0.0f) return false;
   error = weighted / total - centerOffset;
@@ -137,7 +167,7 @@ bool barDetected(unsigned long nowMs, bool lineVisible, float error) {
   }
   if (darkCount == 8) {
     if (barFrames == 0 && nowMs - lastCenteredMs > barCenteredWithinMs) {
-      barFrames = -1000;   // went all-black from off-centre = a corner, ignore
+      barFrames = -1000;   // came from far off-centre = a corner, ignore
     }
     ++barFrames;
   } else {
@@ -148,8 +178,8 @@ bool barDetected(unsigned long nowMs, bool lineVisible, float error) {
 
 // ======================= Line following =======================
 // One continuous PD loop. If the line slips off the sensors for a moment,
-// the motors simply keep their last command (already turning hard toward
-// the line), so the turn carries straight on - no search, no spinning back.
+// the car keeps turning the same way it already was, just without driving
+// forward, so it can't overshoot the corner.
 void followLine(bool lineVisible, float error) {
   const unsigned long nowUs = micros();
   float loopDt = (nowUs - lastFollowUs) * 1.0e-6f;
@@ -158,7 +188,11 @@ void followLine(bool lineVisible, float error) {
 
   if (!lineVisible) {
     trackedLastFrame = false;
-    return;   // hold last motor command
+    currentBase = cornerSpeed;
+
+    const int t = steeringSign * lastEdgeSide * lostTurnPWM;
+    drive(t, -t);
+    return;
   }
 
   const float dt = (nowUs - lastSampleUs) * 1.0e-6f;
@@ -172,8 +206,18 @@ void followLine(bool lineVisible, float error) {
   // Slow down when the line is off-centre OR moving sideways fast.
   const float slowE = fabsf(error) / slowDownError;
   const float slowR = fabsf(filteredRate) / slowDownRate;
-  const float slow = constrain(slowE > slowR ? slowE : slowR, 0.0f, 1.0f);
-  const float targetBase = straightSpeed - (straightSpeed - cornerSpeed) * slow;
+  float slow = slowE > slowR ? slowE : slowR;
+  slow = constrain(slow, 0.0f, 1.0f);
+  float targetBase = straightSpeed - (straightSpeed - cornerSpeed) * slow;
+  const unsigned long nowMs = millis();
+  if (lineGroups >= 2) {
+    if (twoLineSinceMs == 0) twoLineSinceMs = nowMs;
+    if (nowMs - twoLineSinceMs >= twoLineConfirmMs) {
+      targetBase = twoLineSpeed;   // V corner: slow, let steering turn it
+    }
+  } else {
+    twoLineSinceMs = 0;
+  }
   if (targetBase < currentBase) {
     currentBase = targetBase;
   } else {
@@ -186,6 +230,7 @@ void followLine(bool lineVisible, float error) {
 
   drive(constrain((int)(currentBase + turn), -maxPWM, maxPWM),
         constrain((int)(currentBase - turn), -maxPWM, maxPWM));
+
 
   lastError = error;
   lastSampleUs = nowUs;
@@ -257,6 +302,7 @@ void loop() {
     if (centeredFrames >= guideLockFrames) {
       trackedLastFrame = false;
       currentBase = cornerSpeed;
+      lastEdgeSide = 0;
       clearingOnGuide = false;
       trackState = CLEARING_FAR_BAR;
       if (diagnostics) Serial.println("Guide found. Driving back.");
