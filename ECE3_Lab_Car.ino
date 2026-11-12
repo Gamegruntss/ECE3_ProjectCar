@@ -9,32 +9,26 @@ const int rightSleep = 11;
 const int rightDir = 30;
 const int rightPWM = 39;
 
-const int reflectancePins[8] = {65, 48, 64, 47, 52, 68, 53, 69};
 const int evenLed = 45;
 const int oddLed = 61;
-const int barReadDelayUs = 700;
-const int minBarSensors = 8;
 
 // ======================= Speed / steering tuning =======================
 const int steeringSign = -1;
 
-// Top speed on straights. The return trip has its own cap so you can slow
-// down just the complicated half of the track without touching the rest.
-const int outboundStraightSpeed = 90;   // was 50
-const int returnStraightSpeed   = 80;
-const int cornerSpeed           = 45;   // was 32 (32 is near motor stall)
-const int maxTrackingPWM        = 170;  // headroom so the outer wheel can push hard
+const int outboundStraightSpeed = 115;  // v2: 90
+const int returnStraightSpeed   = 105;  // v2: 80
+const int cornerSpeed           = 55;   // v2: 45
+const int maxTrackingPWM        = 210;
 
 // |error| at which the base speed has fully dropped to cornerSpeed.
-const float speedDropError = 20.0f;
-// How fast the base speed may climb back up after a corner (PWM per second).
-// Braking is instant; accelerating is gradual so it doesn't overshoot S-bends.
-const float accelPWMPerSec = 350.0f;
+const float speedDropError = 18.0f;
+// Braking is instant; accelerating back up is limited to this (PWM per second).
+const float accelPWMPerSec = 550.0f;
 
-const float kP = 2.6f;                  // was 2.0
-const float kD = 0.07f;                 // was 0.04
-const float maxDamping = 40.0f;         // was 18
-const float derivativeFilterSeconds = 0.025f;
+const float kP = 3.0f;
+const float kD = 0.09f;
+const float maxDamping = 50.0f;
+const float derivativeFilterSeconds = 0.02f;
 
 // ======================= U-turn (unchanged logic) =======================
 const int pivotPWM = 120;
@@ -43,7 +37,7 @@ const unsigned long pivotSearchStartMs = 380;
 const unsigned long pivotTimeoutMs = 1050;
 const int guideLockFrames = 2;
 const unsigned long barClearMs = 65;
-const int clearSpeed = 60;
+const int clearSpeed = 70;
 
 // ======================= Calibration (unchanged) =======================
 const float sensorMin[8] = {
@@ -54,25 +48,33 @@ const float sensorSpan[8] = {
 };
 const float sensorPosition[8] = {-35, -25, -15, -5, 5, 15, 25, 35};
 const float centerOffset = 1.04f;
-const float noiseFloor = 0.10f;
-const float lineThreshold = 0.20f;
+const float noiseFloor = 0.15f;      // v2: 0.10
+const float lineThreshold = 0.35f;   // v2: 0.20 - stricter "this is the line"
 const float pivotCenterStrength = 0.45f;
 const float pivotCenterError = 8.0f;
 
-// ======================= Bar detection =======================
-// The slow digital bar read (~6 ms) used to run every loop, which capped the
-// control loop at ~100 Hz. Now it only runs when the normal IR read already
-// looks like a bar (lots of dark sensors), so the loop runs ~3x faster.
-// Set useFastBarGate = false to go back to checking every loop.
-const bool useFastBarGate = true;
-const float barStrength = 0.50f;
-const int barCandidateSensors = 6;
+// ======================= Bar detection (strict) =======================
+// A real bar is only accepted if ALL of these are true:
+//  1. All 8 sensors read solidly black (calibrated strength >= barStrength).
+//  2. Just before it, the car was driving centred on a normal-width line
+//     (|error| <= barApproachError) for at least barApproachMs.
+//  3. It went from a normal line to all-black quickly (<= barOnsetMs).
+//     A sharp turn fills the sensors gradually from one side while the
+//     car is already steering, so it fails 2 and/or 3.
+//  4. All-black lasts for barConfirmFrames readings in a row.
+const float barStrength = 0.60f;
+const float barApproachError = 9.0f;
+const unsigned long barApproachMs = 80;
+const unsigned long barOnsetMs = 45;
+const int barConfirmFrames = 3;
+const int narrowLineMax = 3;      // a normal line covers at most this many sensors
+const int wideDarkSensors = 6;    // "mostly black" - used only while crossing the far bar
 
 // ======================= Line-loss recovery =======================
-const int searchSpeed = 75;                    // was 45 (too weak to spin reliably)
-const unsigned long searchLimitMs = 900;       // was 700
-const float gapCenterError = 8.0f;             // line lost while centered = gap, not a turn
-const unsigned long gapCoastMs = 80;           // drive straight this long before spinning
+const int searchSpeed = 80;
+const unsigned long searchLimitMs = 900;
+const float gapCenterError = 8.0f;
+const unsigned long gapCoastMs = 70;
 
 const bool diagnostics = true;
 
@@ -92,8 +94,18 @@ unsigned long clearStartedMs = 0;
 
 uint16_t rawSensors[8];
 float strength[8];
-int strongCount = 0;
+int darkCount = 0;    // sensors >= barStrength
+int lineCount = 0;    // sensors >= lineThreshold
 
+// Bar detector state
+unsigned long lastNarrowMs = 0;
+unsigned long centeredSinceMs = 0;
+bool centeredRun = false;
+bool approachOk = false;
+bool onsetOk = false;
+int fullDarkFrames = 0;
+
+// Line follower state
 float lastError = 0.0f;
 float filteredRate = 0.0f;
 int lastLineSide = 0;
@@ -113,7 +125,6 @@ void writeMotor(int pwmPin, int dirPin, int &dirState, int speed) {
     analogWrite(pwmPin, 0);
     return;
   }
-
   const int direction = speed < 0 ? HIGH : LOW;
   if (dirState != direction) {
     analogWrite(pwmPin, 0);
@@ -129,52 +140,22 @@ void drive(int leftSpeed, int rightSpeed) {
 }
 
 // ======================= Sensors =======================
-int readBarSensorCount() {
-  // Re-enable both emitters before the direct pin reads.
-  digitalWrite(oddLed, HIGH);
-  digitalWrite(evenLed, HIGH);
-  delayMicroseconds(200);
-
-  int highCount = 0;
-  for (int i = 0; i < 8; ++i) {
-    const int pin = reflectancePins[i];
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, HIGH);
-    delayMicroseconds(10);
-    pinMode(pin, INPUT);
-    delayMicroseconds(barReadDelayUs);
-    if (digitalRead(pin) == HIGH) {
-      ++highCount;
-    }
-  }
-  return highCount;
-}
-
-// One IR read per loop; everything else uses these normalized values.
 void readSensors() {
   ECE3_read_IR(rawSensors);
-  strongCount = 0;
+  darkCount = 0;
+  lineCount = 0;
   for (int i = 0; i < 8; ++i) {
     const float s =
       constrain((rawSensors[i] - sensorMin[i]) / sensorSpan[i], 0.0f, 1.0f);
     strength[i] = s;
-    if (s >= barStrength) {
-      ++strongCount;
-    }
+    if (s >= barStrength) ++darkCount;
+    if (s >= lineThreshold) ++lineCount;
   }
 }
 
-bool checkBar() {
-  if (useFastBarGate && strongCount < barCandidateSensors) {
-    return false;
-  }
-  return readBarSensorCount() >= minBarSensors;
-}
-
-// Finds the line using only the peak sensor and its two neighbours.
-// If more than one dark patch is visible (crossings, hairpins where both
-// arms are under the bar, stray marks), it follows the patch closest to
-// where the line was last frame instead of averaging them together.
+// Follows the dark patch closest to where the line was last reading, using
+// only the peak sensor and its two neighbours. Side branches, crossings and
+// the other arm of a hairpin are ignored instead of averaged in.
 bool findLine(float &error, float &centerStrength) {
   centerStrength = strength[3] > strength[4] ? strength[3] : strength[4];
 
@@ -182,14 +163,10 @@ bool findLine(float &error, float &centerStrength) {
   float bestScore = 1.0e9f;
   for (int i = 0; i < 8; ++i) {
     const float s = strength[i];
-    if (s < lineThreshold) {
-      continue;
-    }
+    if (s < lineThreshold) continue;
     const float left = i > 0 ? strength[i - 1] : 0.0f;
     const float right = i < 7 ? strength[i + 1] : 0.0f;
-    if (s < left || s < right) {
-      continue;  // not a local peak
-    }
+    if (s < left || s < right) continue;  // not a local peak
     const float score = trackedLastFrame
       ? fabsf(sensorPosition[i] - centerOffset - lastError)
       : -s;
@@ -198,44 +175,70 @@ bool findLine(float &error, float &centerStrength) {
       best = i;
     }
   }
-
-  if (best < 0) {
-    return false;
-  }
+  if (best < 0) return false;
 
   float total = 0.0f;
   float weighted = 0.0f;
   for (int i = best - 1; i <= best + 1; ++i) {
-    if (i < 0 || i > 7) {
-      continue;
-    }
+    if (i < 0 || i > 7) continue;
     if (strength[i] > noiseFloor) {
       const float w = strength[i] - noiseFloor;
       total += w;
       weighted += w * sensorPosition[i];
     }
   }
-  if (total <= 0.0f) {
-    return false;
-  }
+  if (total <= 0.0f) return false;
   error = weighted / total - centerOffset;
   return true;
 }
 
-// ======================= Line following =======================
-void resetTracking() {
-  trackedLastFrame = false;
-  filteredRate = 0.0f;
-  currentBase = cornerSpeed;
+// Returns true only for a real bar (see rules at the top).
+bool updateBarDetector(unsigned long nowMs, bool lineVisible, float error) {
+  if (lineCount <= narrowLineMax) {
+    lastNarrowMs = nowMs;
+    if (lineVisible && fabsf(error) <= barApproachError) {
+      if (!centeredRun) {
+        centeredRun = true;
+        centeredSinceMs = nowMs;
+      }
+    } else {
+      centeredRun = false;
+    }
+    approachOk = centeredRun && (nowMs - centeredSinceMs >= barApproachMs);
+  }
+
+  if (darkCount == 8) {
+    if (fullDarkFrames == 0) {
+      onsetOk = approachOk && (nowMs - lastNarrowMs <= barOnsetMs);
+      if (diagnostics && !onsetOk &&
+          (trackState == OUTBOUND || trackState == RETURNING)) {
+        Serial.print("Ignored all-black (");
+        Serial.print(approachOk ? "slow onset" : "not centred before");
+        Serial.println(") - treating as a turn");
+      }
+    }
+    ++fullDarkFrames;
+  } else {
+    fullDarkFrames = 0;
+    onsetOk = false;
+  }
+
+  return onsetOk && fullDarkFrames >= barConfirmFrames;
 }
 
+void resetBarDetector() {
+  centeredRun = false;
+  approachOk = false;
+  onsetOk = false;
+  fullDarkFrames = 0;
+}
+
+// ======================= Line following =======================
 void followGuide(bool lineVisible, float error) {
   const unsigned long nowUs = micros();
   const unsigned long nowMs = millis();
   float loopDt = (nowUs - lastFollowUs) * 1.0e-6f;
-  if (loopDt > 0.05f) {
-    loopDt = 0.05f;
-  }
+  if (loopDt > 0.05f) loopDt = 0.05f;
   lastFollowUs = nowUs;
 
   int leftSpeed = 0;
@@ -255,8 +258,6 @@ void followGuide(bool lineVisible, float error) {
       filteredRate = 0.0f;
     }
 
-    // Speed: fast on straights, drop hard as soon as the error grows,
-    // ramp back up gradually.
     const float topSpeed =
       (trackState == OUTBOUND) ? outboundStraightSpeed : returnStraightSpeed;
     const float turnFraction =
@@ -266,9 +267,7 @@ void followGuide(bool lineVisible, float error) {
       currentBase = targetBase;
     } else {
       currentBase += accelPWMPerSec * loopDt;
-      if (currentBase > targetBase) {
-        currentBase = targetBase;
-      }
+      if (currentBase > targetBase) currentBase = targetBase;
     }
 
     const float damping = constrain(kD * filteredRate, -maxDamping, maxDamping);
@@ -285,12 +284,10 @@ void followGuide(bool lineVisible, float error) {
     currentBase = cornerSpeed;
 
     if (fabsf(lastError) < gapCenterError && lostMs < gapCoastMs) {
-      // Line vanished while centered: probably a gap, keep going straight.
-      leftSpeed = cornerSpeed;
+      leftSpeed = cornerSpeed;   // centred when lost: probably a gap
       rightSpeed = cornerSpeed;
     } else if (lastLineSide != 0 && lostMs < searchLimitMs) {
-      // Line ran off one edge (sharp turn): spin hard toward that side.
-      leftSpeed = steeringSign * lastLineSide * searchSpeed;
+      leftSpeed = steeringSign * lastLineSide * searchSpeed;  // ran off an edge
       rightSpeed = -leftSpeed;
     }
   }
@@ -333,7 +330,12 @@ void loop() {
 
   const unsigned long nowMs = millis();
   readSensors();
-  const bool onBar = checkBar();
+
+  float error = 0.0f;
+  float centerStrength = 0.0f;
+  const bool lineVisible = findLine(error, centerStrength);
+  const bool barConfirmed = updateBarDetector(nowMs, lineVisible, error);
+  const bool wideDark = darkCount >= wideDarkSensors;
 
   if (diagnostics) {
     static unsigned long lastPrintMs = 0;
@@ -342,36 +344,34 @@ void loop() {
       Serial.print("state ");
       Serial.print((int)trackState);
       Serial.print("  err ");
-      Serial.print(lastError);
+      Serial.print(lineVisible ? error : 99.0f);
       Serial.print("  dark ");
-      Serial.print(strongCount);
+      Serial.print(darkCount);
       Serial.print("  base ");
       Serial.println((int)currentBase);
     }
   }
 
-  if (trackState == OUTBOUND && onBar) {
+  if (trackState == OUTBOUND && barConfirmed) {
     pivotStartedMs = millis();
     centeredFrames = 0;
+    trackedLastFrame = false;
     trackState = PIVOTING;
     drive(-pivotPWM, pivotPWM);
     if (diagnostics) {
-      Serial.println("Far bar detected. Pivoting.");
+      Serial.println("Far bar confirmed. Pivoting.");
     }
     return;
   }
 
-  if (trackState == RETURNING && onBar) {
+  if (trackState == RETURNING && barConfirmed) {
     drive(0, 0);
     trackState = STOPPED;
     if (diagnostics) {
-      Serial.println("Start bar detected. Stopped.");
+      Serial.println("Start bar confirmed. Stopped.");
     }
     return;
   }
-
-  float error = 0.0f;
-  float centerStrength = 0.0f;
 
   if (trackState == PIVOTING) {
     const unsigned long pivotElapsed = nowMs - pivotStartedMs;
@@ -389,17 +389,18 @@ void loop() {
     }
 
     drive(-pivotSearchPWM, pivotSearchPWM);
-    trackedLastFrame = false;  // pick the strongest patch while spinning
-    const bool lineVisible = findLine(error, centerStrength);
-    const bool centeredGuide = !onBar && lineVisible &&
+    const bool centeredGuide = !wideDark && lineVisible &&
       centerStrength >= pivotCenterStrength && fabsf(error) <= pivotCenterError;
     centeredFrames = centeredGuide ? centeredFrames + 1 : 0;
 
     if (centeredFrames >= guideLockFrames) {
-      resetTracking();
+      trackedLastFrame = false;
+      filteredRate = 0.0f;
+      currentBase = cornerSpeed;
       lastLineSide = 0;
       lastError = error;
       clearingOnGuide = false;
+      resetBarDetector();
       trackState = CLEARING_FAR_BAR;
       followGuide(true, error);
       if (diagnostics) {
@@ -409,21 +410,20 @@ void loop() {
     return;
   }
 
-  if (trackState == CLEARING_FAR_BAR && onBar) {
-    clearingOnGuide = false;
-    trackedLastFrame = false;
-    drive(clearSpeed, clearSpeed);
-    return;
-  }
-
-  const bool lineVisible = findLine(error, centerStrength);
   if (trackState == CLEARING_FAR_BAR) {
+    if (wideDark) {
+      clearingOnGuide = false;
+      trackedLastFrame = false;
+      drive(clearSpeed, clearSpeed);
+      return;
+    }
     if (!lineVisible) {
       clearingOnGuide = false;
     } else if (!clearingOnGuide) {
       clearStartedMs = nowMs;
       clearingOnGuide = true;
     } else if (nowMs - clearStartedMs >= barClearMs) {
+      resetBarDetector();
       trackState = RETURNING;
     }
   }
