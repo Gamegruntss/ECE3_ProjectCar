@@ -13,11 +13,14 @@ const int oddLed = 61;
 
 // ======================= Speed =======================
 const int steeringSign = -1;
-const int straightSpeed = 155;      // centred on a straight
+const int straightSpeed = 165;      // centred on a straight
 const int cornerSpeed   = 48;       // base speed in the tightest turns (was 40)
-const float slowDownError = 18.0f;  // line this far off-centre -> cornerSpeed
-const float slowDownRate  = 300.0f; // line moving this fast    -> cornerSpeed (brakes before the error gets big)
-const float accelPerSec   = 700.0f; // speed climbs back gradually, brakes instantly
+const float slowDownError = 21.0f;  // Previously 18.0f
+const float slowDownRate  = 350.0f; // Previously 300.0f
+const float accelPerSec   = 700.0f; // Unchanged // speed climbs back gradually, brakes instantly
+const int straightBoost = 20;
+const float straightErrorThreshold = 3.0f;
+const float straightRateThreshold = 80.0f;
 
 // Line slips off the sensors (only at sharp corners / the tip): turn on the
 // spot toward the side where the line was LAST seen at the edge of the
@@ -44,19 +47,20 @@ const float derivativeFilterSeconds = 0.02f;
 // ======================= U-turn / stop (unchanged) =======================
 const int pivotPWM = 120;
 const int pivotSearchPWM = 90;
-const unsigned long pivotSearchStartMs = 380;
-const unsigned long pivotTimeoutMs = 1050;
+const unsigned long pivotMinTurnMs = 500;
+const unsigned long pivotTimeoutMs = 2200;
 const int guideLockFrames = 2;
 const unsigned long barClearMs = 65;
 const int clearSpeed = 70;
 
-// Bar = all 8 sensors black for 3 readings AND the car was centred on a
+// Bar = all 8 sensors black for 2 readings AND the car was centred on a
 // normal line shortly before (a sharp corner pulls the line far off-centre
 // first, so it can't pass).
 const float barStrength = 0.60f;
-const int barConfirmFrames = 3;
+const int barConfirmFrames = 2;
 const float barCenteredError = 10.0f;
 const unsigned long barCenteredWithinMs = 150;
+const int maxGuideDarkSensors = 4;
 
 // ======================= Calibration =======================
 const float sensorMin[8] = {
@@ -88,6 +92,7 @@ int lineGroups = 0;              // separate dark lines under the sensors
 int darkCount = 0;
 int barFrames = 0;
 unsigned long lastCenteredMs = 0;
+int finishBarFrames = 0;
 
 float lastError = 0.0f;
 float filteredRate = 0.0f;
@@ -209,6 +214,12 @@ void followLine(bool lineVisible, float error) {
   float slow = slowE > slowR ? slowE : slowR;
   slow = constrain(slow, 0.0f, 1.0f);
   float targetBase = straightSpeed - (straightSpeed - cornerSpeed) * slow;
+  if (fabsf(error) < straightErrorThreshold &&
+    fabsf(filteredRate) < straightRateThreshold &&
+    lineGroups == 1 &&
+    darkCount <= 4) {
+  targetBase += straightBoost;
+}
   const unsigned long nowMs = millis();
   if (lineGroups >= 2) {
     if (twoLineSinceMs == 0) twoLineSinceMs = nowMs;
@@ -279,25 +290,47 @@ void loop() {
     return;
   }
 
-  if (trackState == RETURNING && onBar) {
+// Finish-line detection: require two consecutive
+// readings with all eight sensors on black.
+if (trackState == RETURNING) {
+  if (darkCount == 8) {
+    finishBarFrames++;
+  } else {
+    finishBarFrames = 0;
+  }
+
+  if (finishBarFrames >= 2) {
     drive(0, 0);
     trackState = STOPPED;
-    if (diagnostics) Serial.println("Start bar. Stopped.");
+
+    if (diagnostics) {
+      Serial.println("Finish bar detected. Stopped.");
+    }
+
     return;
   }
+}
 
   if (trackState == PIVOTING) {
     const unsigned long elapsed = nowMs - pivotStartedMs;
-    if (elapsed < pivotSearchStartMs) return;
+
+    // Require a minimum pivot time before searching for the return line.
+    if (elapsed < pivotMinTurnMs) {
+      drive(-pivotPWM, pivotPWM);
+      return;
+    }
+
     if (elapsed >= pivotTimeoutMs) {
       drive(0, 0);
       trackState = STOPPED;
       if (diagnostics) Serial.println("Pivot timed out.");
       return;
     }
+
     drive(-pivotSearchPWM, pivotSearchPWM);
     const bool centered = !wideDark && lineVisible &&
-      centerStrength >= pivotCenterStrength && fabsf(error) <= pivotCenterError;
+      centerStrength >= pivotCenterStrength &&
+      fabsf(error) <= pivotCenterError;
     centeredFrames = centered ? centeredFrames + 1 : 0;
     if (centeredFrames >= guideLockFrames) {
       trackedLastFrame = false;
